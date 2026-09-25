@@ -70,6 +70,9 @@ type Pacemaker struct {
 	lastVoteMsg      *block.PMVoteMessage
 	QCHigh           *block.DraftQC
 	lastCommitted    *block.Block
+	// Zero disables vote extensions; updated consensus parameters must be
+	// applied here before vote extensions can be activated dynamically.
+	voteExtensionEnableHeight int64
 
 	lastOnBeatRound int32
 
@@ -96,7 +99,7 @@ type Pacemaker struct {
 	validatorSetRegistry *ValidatorSetRegistry
 }
 
-func NewPacemaker(ctx context.Context, version string, c *chain.Chain, txpool *txpool.TxPool, communicator *rpc.Communicator, blsMaster *types.BlsMaster, proxyApp cmtproxy.AppConns) *Pacemaker {
+func NewPacemaker(ctx context.Context, version string, c *chain.Chain, txpool *txpool.TxPool, communicator *rpc.Communicator, blsMaster *types.BlsMaster, proxyApp cmtproxy.AppConns, voteExtensionEnableHeight int64) *Pacemaker {
 	prometheus.Register(pmRoundGauge)
 	prometheus.Register(curEpochGauge)
 	prometheus.Register(inCommitteeGauge)
@@ -120,9 +123,10 @@ func NewPacemaker(ctx context.Context, version string, c *chain.Chain, txpool *t
 		broadcastCh:     make(chan *block.PMProposalMessage, 4),
 		addedValidators: make([]*cmttypes.Validator, 0),
 
-		timeoutCounter:       0,
-		lastOnBeatRound:      -1,
-		validatorSetRegistry: NewValidatorSetRegistry(c),
+		timeoutCounter:            0,
+		lastOnBeatRound:           -1,
+		validatorSetRegistry:      NewValidatorSetRegistry(c),
+		voteExtensionEnableHeight: voteExtensionEnableHeight,
 	}
 
 	return p
@@ -141,13 +145,20 @@ func (p *Pacemaker) CreateLeaf(parent *block.DraftBlock, justify *block.DraftQC,
 		targetTime = now
 	}
 
-	commitInfo := &v2.ExtendedCommitInfo{Round: int32(round)}
+	commitInfo := &v2.ExtendedCommitInfo{Round: int32(parent.Round)}
 	contains := commitInfoCache.Contains(parent.ProposedBlock.ID().String())
 	if contains {
 		cachedInfo, _ := commitInfoCache.Get(parent.ProposedBlock.ID().String())
-		commitInfo = cachedInfo.(*v2.ExtendedCommitInfo)
+		if cachedInfo != nil {
+			commitInfo = cachedInfo.(*v2.ExtendedCommitInfo)
+		}
 	}
-	res, err := p.executor.PrepareProposal(parent, p.epochState.index, int32(p.currentRound), commitInfo)
+	if p.voteExtensionsEnabled(parent.Height) && len(commitInfo.Votes) == 0 {
+		// A QC only contains the signer bitset, not the individual application
+		// extensions. Do not propose a block with fabricated oracle votes.
+		return fmt.Errorf("missing extended votes for parent height %d", parent.Height), nil
+	}
+	res, err := p.executor.PrepareProposal(parent, p.epochState.index, int32(p.currentRound), commitInfo, targetTime)
 	if err != nil {
 		return err, nil
 	}
@@ -375,19 +386,16 @@ func (p *Pacemaker) OnReceiveProposal(mi IncomingMsg) {
 	}
 
 	if bnew.Height >= p.lastVotingHeight && p.ExtendedFromLastCommitted(bnew) {
-		// FIXME: should check if vote extension is turned on
-		// res, err := p.executor.proxyApp.ExtendVote(context.TODO(), &abcitypes.ExtendVoteRequest{
-		// 	Hash:   bnew.ProposedBlock.ID().Bytes(),
-		// 	Height: int64(bnew.ProposedBlock.Number()),
-		// })
-
-		// if err != nil {
-		// 	p.logger.Error("could not extend vote", "err", err)
-		// 	panic(err)
-		// }
-
-		voteExtension := []byte{}
-		nonRpExtension := []byte{}
+		var voteExtension, nonRpExtension []byte
+		if p.voteExtensionsEnabled(bnew.Height) {
+			ext, err := p.executor.ExtendVoteForBlock(bnew.ProposedBlock)
+			if err != nil {
+				p.logger.Error("could not extend vote", "height", bnew.Height, "err", err)
+				return
+			}
+			voteExtension = ext.VoteExtension
+			nonRpExtension = ext.NonRpExtension
+		}
 
 		voteMsg, err := p.BuildVoteMessage(msg, voteExtension, nonRpExtension)
 		if err != nil {
@@ -438,6 +446,9 @@ func (p *Pacemaker) OnReceiveVote(mi IncomingMsg) {
 		return
 	}
 
+	if !p.verifyApplicationVoteExtension(msg.GetSignerIndex(), msg.VoteBlockID, msg.VoteExtension, msg.ExtensionSignature, msg.NonRpVoteExtension, msg.NonRpExtensionSignature) {
+		return
+	}
 	qc, commitInfo := p.epochState.AddQCVote(msg.GetSignerIndex(), round, msg.VoteBlockID, msg.VoteSignature, msg.VoteExtension, msg.ExtensionSignature, msg.NonRpVoteExtension, msg.NonRpExtensionSignature)
 	if qc == nil {
 		p.logger.Debug("no qc formed")
@@ -457,12 +468,11 @@ func (p *Pacemaker) OnReceiveVote(mi IncomingMsg) {
 func (p *Pacemaker) OnPropose(qc *block.DraftQC, round uint32) *block.DraftBlock {
 	parent := p.chain.GetDraftByEscortQC(qc.QC)
 	err, bnew := p.CreateLeaf(parent, qc, round)
-
-	fmt.Println("Proposed block: ", bnew.ProposedBlock)
-	if err != nil {
+	if err != nil || bnew == nil {
 		p.logger.Error("could not create leaf", "err", err)
 		return nil
 	}
+	fmt.Println("Proposed block: ", bnew.ProposedBlock)
 
 	if bnew.Height <= qc.QC.Number() {
 		p.logger.Error("proposed block refers to an invalid qc", "proposedQC", qc.QC.Number(), "proposedHeight", bnew.Height)
@@ -554,13 +564,18 @@ func (p *Pacemaker) OnReceiveTimeout(mi IncomingMsg) {
 	}
 
 	// collect vote and see if QC is formed
+	if msg.LastVoteBlockID != (types.Bytes32{}) && !p.verifyApplicationVoteExtension(msg.SignerIndex, msg.LastVoteBlockID, msg.LastVoteExtension, msg.LastExtensionSignature, msg.LastNonRpVoteExtension, msg.LastNonRpExtensionSignature) {
+		return
+	}
 	newQC, commitInfo := p.epochState.AddQCVote(msg.SignerIndex, msg.LastVoteRound, msg.LastVoteBlockID, msg.LastVoteSignature, msg.LastVoteExtension, msg.LastExtensionSignature, msg.LastNonRpVoteExtension, msg.LastNonRpExtensionSignature)
 	if newQC != nil {
 		escortQCNode := p.chain.GetDraftByEscortQC(newQC)
 		p.UpdateQCHigh(&block.DraftQC{QCNode: escortQCNode, QC: newQC})
 		p.Update(newQC)
 	}
-	commitInfoCache.Add(msg.LastVoteBlockID.String(), commitInfo)
+	if commitInfo != nil {
+		commitInfoCache.Add(msg.LastVoteBlockID.String(), commitInfo)
+	}
 
 	qc := msg.DecodeQCHigh()
 	qcNode := p.chain.GetDraftByEscortQC(qc)

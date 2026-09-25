@@ -99,7 +99,7 @@ func (vals *ValidatorSetAdapter) ToValidatorSet() *cmttypes.ValidatorSet {
 }
 
 func ApplyUpdatesToValidatorSet(vset *cmttypes.ValidatorSet, validatorUpdates []v2.ValidatorUpdate) *cmttypes.ValidatorSet {
-	vs := vset.Validators
+	vs := vset.Copy().Validators
 
 	addedIndex := make(map[int]bool)
 	for i, _ := range validatorUpdates {
@@ -108,26 +108,32 @@ func ApplyUpdatesToValidatorSet(vset *cmttypes.ValidatorSet, validatorUpdates []
 
 	// delete/update existing validator
 	for i := 0; i < len(vs); {
-		v := vs[i]
+		matched := false
 		for j, update := range validatorUpdates {
-			if bytes.Equal(v.PubKey.Bytes(), update.PubKeyBytes) {
-				if v.VotingPower == 0 {
-					vs = append(vs[:i], vs[i+1:]...)
-					delete(addedIndex, j)
-					break
-				} else {
-					vs[i].VotingPower = update.Power
-					i++
-					delete(addedIndex, j)
-					break
-				}
+			if !bytes.Equal(vs[i].PubKey.Bytes(), update.PubKeyBytes) {
+				continue
 			}
+			matched = true
+			delete(addedIndex, j)
+			if update.Power == 0 {
+				vs = append(vs[:i], vs[i+1:]...)
+			} else {
+				vs[i].VotingPower = update.Power
+				i++
+			}
+			break
+		}
+		if !matched {
+			i++
 		}
 	}
 
 	// add new validator
-	for i, _ := range addedIndex {
+	for i := range addedIndex {
 		added := validatorUpdates[i]
+		if added.Power == 0 {
+			continue
+		}
 		pubKey, err := cryptoencoding.PubKeyFromTypeAndBytes(added.PubKeyType, added.PubKeyBytes)
 		if err != nil {
 			fmt.Errorf("can't decode public key: %w", err)

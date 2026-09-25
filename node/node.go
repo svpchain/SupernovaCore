@@ -184,7 +184,7 @@ func NewNode(
 	communicator := rpc.NewCommunicator(ctx, chain, txPool, p2pSrv, rpcServer)
 	p2pSrv.Host().Network().Notify(communicator)
 
-	pacemaker := consensus.NewPacemaker(ctx, config.Version, chain, txPool, communicator, blsMaster, proxyApp)
+	pacemaker := consensus.NewPacemaker(ctx, config.Version, chain, txPool, communicator, blsMaster, proxyApp, genDoc.ConsensusParams.Feature.VoteExtensionsEnableHeight)
 
 	pubkey, err := privValidator.GetPubKey()
 

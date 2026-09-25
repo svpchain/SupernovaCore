@@ -27,14 +27,18 @@ type QCVoteManager struct {
 	votes         map[voteKey]map[uint32]*voteValue
 	sealed        map[voteKey]bool
 	committeeSize uint32
+	committee     *cmttypes.ValidatorSet
+	validators    []*cmttypes.Validator
 	logger        *slog.Logger
 }
 
-func NewQCVoteManager(committeeSize uint32) *QCVoteManager {
+func NewQCVoteManager(committee *cmttypes.ValidatorSet) *QCVoteManager {
 	return &QCVoteManager{
 		votes:         make(map[voteKey]map[uint32]*voteValue),
 		sealed:        make(map[voteKey]bool), // sealed indicator
-		committeeSize: committeeSize,
+		committeeSize: uint32(committee.Size()),
+		committee:     committee,
+		validators:    committee.Validators,
 		logger:        slog.With("pkg", "qcman"),
 	}
 }
@@ -66,7 +70,14 @@ func (m *QCVoteManager) AddVerifiedVote(index uint32, validator *cmttypes.Valida
 	}
 
 	voteCount := uint32(len(m.votes[key]))
-	if block.MajorityTwoThird(voteCount, m.committeeSize) {
+	bitArray := cmn.NewBitArray(int(m.committeeSize))
+	for signer := range m.votes[key] {
+		if signer >= m.committeeSize {
+			return nil, nil
+		}
+		bitArray.SetIndex(int(signer), true)
+	}
+	if block.HasTwoThirdsVotingPower(bitArray, m.committee) {
 		m.seal(round, blockID)
 		qc, commitInfo := m.Aggregate(round, blockID, epoch)
 		m.logger.Info(
@@ -94,11 +105,20 @@ func (m *QCVoteManager) Aggregate(round uint32, blockID types.Bytes32, epoch uin
 	key := voteKey{Round: round, BlockID: blockID}
 
 	bitArray := cmn.NewBitArray(int(m.committeeSize))
-	votes := make([]v2.ExtendedVoteInfo, 0)
-	for index, v := range m.votes[key] {
-		sigs = append(sigs, v.Signature)
-		bitArray.SetIndex(int(index), true)
-		votes = append(votes, v.VoteInfo)
+	// SVP's Slinky proposal handler expects an ExtendedCommitInfo entry for
+	// every validator in canonical committee order, including absent votes.
+	votes := make([]v2.ExtendedVoteInfo, 0, len(m.validators))
+	for index, validator := range m.validators {
+		if v, ok := m.votes[key][uint32(index)]; ok {
+			sigs = append(sigs, v.Signature)
+			bitArray.SetIndex(index, true)
+			votes = append(votes, v.VoteInfo)
+		} else {
+			votes = append(votes, v2.ExtendedVoteInfo{
+				Validator:   cmttypes.TM2PB.Validator(validator),
+				BlockIdFlag: cmttypesv2.BlockIDFlagAbsent,
+			})
+		}
 	}
 	aggrSig := bls.AggregateSignatures(sigs)
 

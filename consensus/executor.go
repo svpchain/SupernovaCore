@@ -40,13 +40,13 @@ func (e *Executor) InitChain(req *abcitypes.InitChainRequest) (*abcitypes.InitCh
 	return e.proxyApp.InitChain(context.TODO(), req)
 }
 
-func (e *Executor) PrepareProposal(parent *block.DraftBlock, proposerIndex int, round int32, commitInfo *v2.ExtendedCommitInfo) (*abcitypes.PrepareProposalResponse, error) {
+func (e *Executor) PrepareProposal(parent *block.DraftBlock, proposerIndex int, round int32, commitInfo *v2.ExtendedCommitInfo, proposalTime time.Time) (*abcitypes.PrepareProposalResponse, error) {
 	maxBytes := int64(cmttypes.MaxBlockSizeBytes)
 
 	evSize := int64(0)
 	vset := e.chain.GetValidatorsByHash(parent.ProposedBlock.NextValidatorsHash())
 	maxDataBytes := cmttypes.MaxDataBytes(maxBytes, evSize, vset.Size())
-	proposerAddr, validator := vset.GetByIndex(int32(proposerIndex))
+	proposerAddr, _ := vset.GetByIndex(int32(proposerIndex))
 
 	executables := e.txPool.Executables()
 	txs := make([][]byte, 0)
@@ -54,16 +54,44 @@ func (e *Executor) PrepareProposal(parent *block.DraftBlock, proposerIndex int, 
 		txs = append(txs, tx)
 	}
 
-	return e.proxyApp.PrepareProposal(context.TODO(), &v2.PrepareProposalRequest{
+	// The application is responsible for constructing and ordering its own
+	// proposal transactions (e.g. SVP's MsgProposedOperations and oracle txs).
+	// Preserve the actual extended votes, rather than fabricating a proposer vote.
+	lastCommit := v2.ExtendedCommitInfo{Round: round}
+	if commitInfo != nil {
+		lastCommit = *commitInfo
+	}
+	response, err := e.proxyApp.PrepareProposal(context.TODO(), &v2.PrepareProposalRequest{
 		MaxTxBytes:         maxDataBytes,
 		Txs:                txs,
-		LocalLastCommit:    v2.ExtendedCommitInfo{Round: round, Votes: []v2.ExtendedVoteInfo{{Validator: cmttypes.TM2PB.Validator(validator)}}},
+		LocalLastCommit:    lastCommit,
 		Misbehavior:        make([]v2.Misbehavior, 0), // FIXME: track the misbehavior and preppare the evidence
 		Height:             int64(parent.Height) + 1,
-		Time:               time.Now(),
+		Time:               proposalTime,
 		NextValidatorsHash: parent.ProposedBlock.NextValidatorsHash(),
 		ProposerAddress:    proposerAddr,
 	})
+	if err != nil {
+		return nil, err
+	}
+	if response == nil {
+		return nil, fmt.Errorf("PrepareProposal returned nil response")
+	}
+	if err := validatePreparedTxs(response.Txs, maxDataBytes); err != nil {
+		return nil, err
+	}
+	return response, nil
+}
+
+func validatePreparedTxs(txs [][]byte, maxBytes int64) error {
+	var total int64
+	for _, tx := range txs {
+		if len(tx) == 0 || int64(len(tx)) > maxBytes-total {
+			return fmt.Errorf("PrepareProposal returned invalid transactions: %d bytes used, limit %d", total, maxBytes)
+		}
+		total += int64(len(tx))
+	}
+	return nil
 }
 
 func (e *Executor) ProcessProposal(blk *block.Block) (bool, error) {
@@ -194,7 +222,10 @@ func (e *Executor) applyBlock(blk *block.Block, syncingToHeight int64) (appHash 
 		e.logger.Info("block has validator updates", "len", len(abciResponse.ValidatorUpdates))
 		curVSet := e.chain.GetValidatorsByHash(blk.ValidatorsHash())
 		e.logger.Info("current validator set", "len", len(curVSet.Validators), "hash", hex.EncodeToString(curVSet.Hash()))
-		nxtVSet = calcNewValidatorSet(curVSet, abciResponse.ValidatorUpdates, abciResponse.Events)
+		nxtVSet, err = calcNewValidatorSet(curVSet, abciResponse.ValidatorUpdates, abciResponse.Events)
+		if err != nil {
+			return nil, nil, fmt.Errorf("calculate next validator set: %w", err)
+		}
 		e.logger.Info("next validator set", "len", len(nxtVSet.Validators), "hash", hex.EncodeToString(nxtVSet.Hash()))
 	} else {
 		nxtVSet = nil
@@ -203,9 +234,9 @@ func (e *Executor) applyBlock(blk *block.Block, syncingToHeight int64) (appHash 
 	return
 }
 
-func calcNewValidatorSet(vset *cmttypes.ValidatorSet, updates abcitypes.ValidatorUpdates, events []abcitypes.Event) (nxtVSet *cmttypes.ValidatorSet) {
+func calcNewValidatorSet(vset *cmttypes.ValidatorSet, updates abcitypes.ValidatorUpdates, events []abcitypes.Event) (nxtVSet *cmttypes.ValidatorSet, err error) {
 	if updates.Len() <= 0 {
-		return
+		return nil, nil
 	}
 	nxtVSetAdapter := cmn.NewValidatorSetAdapter(vset)
 
@@ -240,7 +271,7 @@ func calcNewValidatorSet(vset *cmttypes.ValidatorSet, updates abcitypes.Validato
 	for _, update := range updates {
 		pubkey, err := bls12381.NewPublicKeyFromBytes(update.PubKeyBytes)
 		if err != nil {
-			panic(err)
+			return nil, fmt.Errorf("invalid validator update public key (%d bytes, type %q): %w", len(update.PubKeyBytes), update.PubKeyType, err)
 		}
 		if update.Power == 0 {
 			nxtVSetAdapter.DeleteByPubkey(update.PubKeyBytes)
@@ -264,7 +295,7 @@ func calcNewValidatorSet(vset *cmttypes.ValidatorSet, updates abcitypes.Validato
 	}
 	fmt.Println("--------------------------------------------------")
 
-	return
+	return nxtVSet, nil
 }
 
 func CalcAddedValidators(curVSet, nxtVSet *cmttypes.ValidatorSet) (added []*cmttypes.Validator) {

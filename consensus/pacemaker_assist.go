@@ -131,9 +131,7 @@ func (p *Pacemaker) verifyTC(tc *types.TimeoutCert, round uint32) bool {
 		if !bytes.Equal(tc.MsgHash[:], voteHash[:]) {
 			return false
 		}
-		// check vote count
-		voteCount := tc.BitArray.Count()
-		if !block.MajorityTwoThird(uint32(voteCount), p.epochState.CommitteeSize()) {
+		if !block.HasTwoThirdsVotingPower(tc.BitArray, p.epochState.committee) {
 			return false
 		}
 

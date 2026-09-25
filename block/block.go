@@ -12,7 +12,6 @@ import (
 	"io"
 	"log/slog"
 	"math"
-	"strings"
 	"sync/atomic"
 	"time"
 
@@ -69,23 +68,38 @@ func MajorityTwoThird(voterNum, committeeSize uint32) bool {
 	return float64(voterNum) >= twoThirds
 }
 
-func (b *Block) VerifyQC(escortQC *QuorumCert, blsMaster *types.BlsMaster, committee *cmttypes.ValidatorSet) (bool, error) {
-	committeeSize := uint32(committee.Size())
-	if b == nil {
-		// decode block to get qc
-		// slog.Error("can not decode block", err)
-		return false, errors.New("block empty")
+// HasTwoThirdsVotingPower implements the strict >2/3 threshold used by
+// CometBFT and the SVP staking validator set. A count of signatures is not
+// equivalent when validators have unequal voting power.
+func HasTwoThirdsVotingPower(votes *cmn.BitArray, committee *cmttypes.ValidatorSet) bool {
+	if votes == nil || committee == nil || votes.Size() != committee.Size() {
+		return false
 	}
+	var total, signed int64
+	for index, validator := range committee.Validators {
+		total += validator.VotingPower
+		if votes.GetIndex(index) {
+			signed += validator.VotingPower
+		}
+	}
+	return total > 0 && signed > total*2/3
+}
 
-	// genesis/first block does not have qc
-	if strings.EqualFold(b.ID().String(), escortQC.BlockID.String()) && (b.Number() == 0 || b.Number() == 1) {
+func (b *Block) VerifyQC(escortQC *QuorumCert, blsMaster *types.BlsMaster, committee *cmttypes.ValidatorSet) (bool, error) {
+	if b == nil || escortQC == nil || committee == nil {
+		return false, errors.New("block, QC, or committee is empty")
+	}
+	if b.ID() != escortQC.BlockID {
+		return false, errors.New("QC does not certify the supplied block")
+	}
+	// Only genesis carries an unsigned synthetic escort QC. Block 1 must
+	// already be certified by real validator votes.
+	if b.Number() == 0 {
 		return true, nil
 	}
 
-	// check vote count
-	voteCount := escortQC.BitArray.Count()
-	if !MajorityTwoThird(uint32(voteCount), committeeSize) {
-		return false, fmt.Errorf("not enough votes (%d/%d)", voteCount, committeeSize)
+	if !HasTwoThirdsVotingPower(escortQC.BitArray, committee) {
+		return false, errors.New("QC lacks >2/3 voting power or has an invalid bit array")
 	}
 
 	pubkeys := make([]bls.PublicKey, 0)
@@ -95,7 +109,7 @@ func (b *Block) VerifyQC(escortQC *QuorumCert, blsMaster *types.BlsMaster, commi
 				cmnPubkey, err := cmn.PublicKeyFromBytes(v.PubKey.Bytes())
 				if err != nil {
 					// FIXME: implement this
-					panic("unsupported pubkey type")
+					return false, fmt.Errorf("invalid QC validator public key: %w", err)
 				}
 				pubkeys = append(pubkeys, cmnPubkey)
 			}

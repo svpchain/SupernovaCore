@@ -5,6 +5,7 @@ import (
 	"log/slog"
 
 	"github.com/OffchainLabs/prysm/v6/crypto/bls"
+	cmttypes "github.com/cometbft/cometbft/v2/types"
 	"github.com/meterio/supernova/block"
 	cmn "github.com/meterio/supernova/libs/common"
 	"github.com/meterio/supernova/types"
@@ -24,14 +25,16 @@ type TCVoteManager struct {
 	votes         map[timeoutVoteKey]map[uint32]*timeoutVoteValue
 	sealed        map[timeoutVoteKey]bool
 	committeeSize uint32
+	committee     *cmttypes.ValidatorSet
 	logger        *slog.Logger
 }
 
-func NewTCVoteManager(committeeSize uint32) *TCVoteManager {
+func NewTCVoteManager(committee *cmttypes.ValidatorSet) *TCVoteManager {
 	return &TCVoteManager{
 		votes:         make(map[timeoutVoteKey]map[uint32]*timeoutVoteValue),
 		sealed:        make(map[timeoutVoteKey]bool), // sealed indicator
-		committeeSize: committeeSize,
+		committeeSize: uint32(committee.Size()),
+		committee:     committee,
 		logger:        slog.With("pkg", "tcman"),
 	}
 }
@@ -58,7 +61,14 @@ func (m *TCVoteManager) AddVote(index uint32, epoch uint64, round uint32, sig []
 	m.votes[key][index] = &timeoutVoteValue{Signature: blsSig, Hash: hash}
 
 	voteCount := uint32(len(m.votes[key]))
-	if block.MajorityTwoThird(voteCount, m.committeeSize) {
+	bitArray := cmn.NewBitArray(int(m.committeeSize))
+	for signer := range m.votes[key] {
+		if signer >= m.committeeSize {
+			return nil
+		}
+		bitArray.SetIndex(int(signer), true)
+	}
+	if block.HasTwoThirdsVotingPower(bitArray, m.committee) {
 		m.seal(epoch, round)
 		tc := m.Aggregate(epoch, round)
 		m.logger.Info(

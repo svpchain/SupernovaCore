@@ -2,6 +2,7 @@ package consensus
 
 import (
 	"errors"
+	"fmt"
 	"log/slog"
 
 	abcitypes "github.com/cometbft/cometbft/v2/abci/types"
@@ -93,7 +94,7 @@ func (vr *ValidatorSetRegistry) Update(num uint32, vset *cmttypes.ValidatorSet, 
 	for _, update := range updates {
 		pubkey, err := bls12381.NewPublicKeyFromBytes(update.PubKeyBytes)
 		if err != nil {
-			panic(err)
+			return nil, nil, fmt.Errorf("invalid validator update public key (%d bytes, type %q): %w", len(update.PubKeyBytes), update.PubKeyType, err)
 		}
 		if update.Power == 0 {
 			nxtVSetAdapter.DeleteByPubkey(update.PubKeyBytes)

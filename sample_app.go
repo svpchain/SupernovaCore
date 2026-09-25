@@ -3,13 +3,15 @@ package main
 import (
 	"bytes"
 	"context"
-	"encoding/hex"
+	"encoding/binary"
 	"errors"
 	"log"
 
 	"github.com/cockroachdb/pebble"
 	abcitypes "github.com/cometbft/cometbft/v2/abci/types"
 )
+
+var lastBlockHeightKey = []byte("\x00supernova/last-block-height")
 
 type KVStoreApplication struct {
 	db           *pebble.DB
@@ -32,7 +34,18 @@ func (app *KVStoreApplication) isValid(tx []byte) uint32 {
 }
 
 func (app *KVStoreApplication) Info(_ context.Context, info *abcitypes.InfoRequest) (*abcitypes.InfoResponse, error) {
-	return &abcitypes.InfoResponse{}, nil
+	value, closer, err := app.db.Get(lastBlockHeightKey)
+	if errors.Is(err, pebble.ErrNotFound) {
+		return &abcitypes.InfoResponse{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer closer.Close()
+	if len(value) != 8 {
+		return nil, errors.New("invalid persisted application height")
+	}
+	return &abcitypes.InfoResponse{LastBlockHeight: int64(binary.BigEndian.Uint64(value))}, nil
 }
 
 func (app *KVStoreApplication) Query(_ context.Context, req *abcitypes.QueryRequest) (*abcitypes.QueryResponse, error) {
@@ -60,7 +73,8 @@ func (app *KVStoreApplication) CheckTx(_ context.Context, check *abcitypes.Check
 }
 
 func (app *KVStoreApplication) InitChain(_ context.Context, chain *abcitypes.InitChainRequest) (*abcitypes.InitChainResponse, error) {
-	return &abcitypes.InitChainResponse{}, nil
+	// The genesis builder uses InitChain validators to construct the first committee.
+	return &abcitypes.InitChainResponse{Validators: chain.Validators}, nil
 }
 
 func (app *KVStoreApplication) PrepareProposal(_ context.Context, proposal *abcitypes.PrepareProposalRequest) (*abcitypes.PrepareProposalResponse, error) {
@@ -109,32 +123,13 @@ func (app *KVStoreApplication) FinalizeBlock(_ context.Context, req *abcitypes.F
 		}
 	}
 
-	nova2PubkeyHex := "9016f8eba9f86d6a9bd880b50925b28d5dea35e9fa6de82da4a8f355ccfc68bbbe1f9374b97f67ce3e3c0689c9fa075c"
-	if req.Height == 6 {
-		pubkey, _ := hex.DecodeString(nova2PubkeyHex)
-		updates = append(updates, abcitypes.ValidatorUpdate{
-			Power:       10,
-			PubKeyBytes: pubkey,
-			PubKeyType:  "bls12-381.pubkey",
-		})
-		events = append(events, abcitypes.Event{
-			Type: "ValidatorExtra",
-			Attributes: []abcitypes.EventAttribute{
-				{Key: "pubkey", Value: nova2PubkeyHex},
-				{Key: "name", Value: "nova-2"},
-				{Key: "ip", Value: "52.22.222.17"},
-				{Key: "port", Value: "8670"},
-			},
-		})
-	}
+	// Keep the single-node demo's validator set unchanged. Adding a second
+	// validator here would require a second running node to reach quorum.
 
-	if req.Height == 20 {
-		pubkey, _ := hex.DecodeString(nova2PubkeyHex)
-		updates = append(updates, abcitypes.ValidatorUpdate{
-			Power:       0,
-			PubKeyBytes: pubkey,
-			PubKeyType:  "bls12-381.pubkey",
-		})
+	var heightBytes [8]byte
+	binary.BigEndian.PutUint64(heightBytes[:], uint64(req.Height))
+	if err := app.onGoingBatch.Set(lastBlockHeightKey, heightBytes[:], pebble.NoSync); err != nil {
+		return nil, err
 	}
 
 	if err := app.onGoingBatch.Commit(pebble.Sync); err != nil {

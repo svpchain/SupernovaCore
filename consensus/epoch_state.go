@@ -79,8 +79,8 @@ func NewEpochState(c *chain.Chain, leaf *block.Block, myPubKey cmtcrypto.PubKey)
 		committee:     committee,
 		inCommittee:   inCommittee,
 		index:         index,
-		qcVoteManager: NewQCVoteManager(uint32(committee.Size())),
-		tcVoteManager: NewTCVoteManager(uint32(committee.Size())),
+		qcVoteManager: NewQCVoteManager(committee),
+		tcVoteManager: NewTCVoteManager(committee),
 		pending:       false,
 	}, nil
 }
