@@ -31,7 +31,7 @@ const (
 	RoundInterval        = 2 * time.Second
 	RoundTimeoutInterval = RoundInterval * 4 // round timeout 8 secs.
 	ProposeTimeLimit     = 1300 * time.Millisecond
-	BroadcastTimeLimit   = 1400 * time.Millisecond
+	BroadcastTimeLimit   = 50 * time.Millisecond
 )
 
 var (
