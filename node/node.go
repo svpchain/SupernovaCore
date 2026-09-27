@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/beevik/ntp"
@@ -171,6 +172,11 @@ func NewNode(
 	// BootstrapNodes = append(BootstrapNodes, "enr:-MK4QMWkLjGkpPB2iP84pdrBqyB-SjJiodPu0oLYQLVLXhgmPMeqN8Nk24Al9mElveJXJFaZUkjwWHAsz1oJN_A-hYeGAZSlsvkzh2F0dG5ldHOIAAAAAAAAAACEZXRoMpAWc8IXAQAAAAAiAQAAAAAAgmlkgnY0gmlwhKwfEoiJc2VjcDI1NmsxoQMog1olklG4kSkaiGepYTRoy0OseZus8-cOKqzsOqlkBIhzeW5jbmV0cwCDdGNwgjLIg3VkcIIu4A") // simd nova2
 	// BootstrapNodes = append(BootstrapNodes, "enr:-MK4QGD2XTHBtQ_r17bA3MHvUqrhVfKvKKqIeDN3sD-YVhkSM2j6oiv2fKHTK_5lvCn6OPa-WHZ3m9Ao1C6oz9P6i9KGAZSlsvidh2F0dG5ldHOIAAAAAAAAAACEZXRoMpAWc8IXAQAAAAAiAQAAAAAAgmlkgnY0gmlwhKwfHXiJc2VjcDI1NmsxoQOucvYee5KxdMkhPqF4W8KGJGSuOhqzk59ZJiPyogCn6ohzeW5jbmV0cwCDdGNwgjLIg3VkcIIu4A") // simd nova1
 
+	// p2p.seeds (comma-separated discv5 ENRs) replaces the built-in list
+	if seeds := splitCommaSeparated(config.P2P.Seeds); len(seeds) > 0 {
+		BootstrapNodes = seeds
+	}
+
 	geneBlock, err := chain.GetTrunkBlock(0)
 	if err != nil {
 		return nil, err
@@ -239,8 +245,12 @@ func createAndStartProxyAppConns(clientCreator cmtproxy.ClientCreator, metrics *
 
 func newP2PService(ctx context.Context, config *cmtcfg.Config, bootstrapNodes []string, geneBlock *block.Block) *p2p.Service {
 	svc, err := p2p.NewService(ctx, &p2p.Config{
-		NoDiscovery: false,
-		// StaticPeers:          slice.SplitCommaSeparated(cliCtx.StringSlice(cmd.StaticPeers.Name)),
+		// p2p.pex = false disables discv5 discovery (e.g. fixed topologies
+		// that list every peer in p2p.persistent_peers)
+		NoDiscovery: !config.P2P.PexReactor,
+		// p2p.persistent_peers: comma-separated libp2p multiaddrs
+		// (/ip4/<ip>/tcp/<port>/p2p/<peer-id>) or ENRs, dialed and kept as trusted peers
+		StaticPeers:          splitCommaSeparated(config.P2P.PersistentPeers),
 		Discv5BootStrapAddrs: p2p.ParseBootStrapAddrs(bootstrapNodes),
 		// RelayNodeAddr:        cliCtx.String(cmd.RelayNode.Name),
 		DataDir: config.RootDir,
@@ -674,4 +684,14 @@ func (n *Node) validateBlock(
 
 	n.logger.Debug("validated block", "id", block.CompactString(), "elapsed", types.PrettyDuration(time.Since(start)))
 	return nil
+}
+
+func splitCommaSeparated(s string) []string {
+	var out []string
+	for _, part := range strings.Split(s, ",") {
+		if part = strings.TrimSpace(part); part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
 }
