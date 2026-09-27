@@ -14,6 +14,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"sync/atomic"
 	"time"
 
 	cmtproxy "github.com/cometbft/cometbft/v2/proxy"
@@ -51,6 +52,16 @@ type Result struct {
 type APIServer struct {
 	listenAddr string
 	handler    http.Handler
+
+	// broadcast_tx_sync adds txs to the pool without CheckTx; embedders that
+	// submit through the application (which runs CheckTx) can turn it off.
+	broadcastDisabled atomic.Bool
+}
+
+// DisableBroadcast makes broadcast_tx_sync return an error instead of adding
+// unchecked txs to the pool.
+func (api *APIServer) DisableBroadcast() {
+	api.broadcastDisabled.Store(true)
 }
 
 // loggingMiddleware logs request and response
@@ -90,6 +101,7 @@ func (rw *responseCapture) Write(b []byte) (int, error) {
 // New return api router
 func NewAPIServer(proxyAppQuery cmtproxy.AppConnQuery, listenAddr string, chainId uint64, version string, chain *chain.Chain, txPool *txpool.TxPool, pacemaker *consensus.Pacemaker, pubkey []byte, p2pSrv p2p.P2P) *APIServer {
 	router := mux.NewRouter()
+	srv := &APIServer{listenAddr: listenAddr}
 
 	logger := slog.With("mod", "api")
 
@@ -127,6 +139,12 @@ func NewAPIServer(proxyAppQuery cmtproxy.AppConnQuery, listenAddr string, chainI
 			case "abci_query":
 				result, err = handler.HandleABCIQuery(params)
 			case "broadcast_tx_sync":
+				if srv.broadcastDisabled.Load() {
+					json.NewEncoder(w).Encode(cmtrpctypes.NewRPCErrorResponse(jsonReq.ID, -32601,
+						"broadcast_tx_sync is disabled on this node",
+						"submit transactions through the application's RPC so they pass CheckTx"))
+					return
+				}
 				result, err = handler.HandleBroadcastTx(params)
 			}
 
@@ -164,11 +182,10 @@ func NewAPIServer(proxyAppQuery cmtproxy.AppConnQuery, listenAddr string, chainI
 		http.Error(w, "Not found", http.StatusNotFound)
 	})
 
-	return &APIServer{
-		listenAddr: listenAddr,
-		handler: handlers.CORS(
-			handlers.AllowedOrigins([]string{"*"}),
-			handlers.AllowedHeaders([]string{"content-type"}))(router)}
+	srv.handler = handlers.CORS(
+		handlers.AllowedOrigins([]string{"*"}),
+		handlers.AllowedHeaders([]string{"content-type"}))(router)
+	return srv
 }
 
 func (api *APIServer) Start(ctx context.Context) {

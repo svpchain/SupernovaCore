@@ -593,6 +593,18 @@ func checkClockOffset() {
 	}
 }
 
+// TxPool returns the node's transaction pool, for embedders that validate txs
+// themselves (e.g. via the app's CheckTx) and add them in-process.
+func (n *Node) TxPool() *txpool.TxPool {
+	return n.txPool
+}
+
+// DisableAPIBroadcast turns off the API's broadcast_tx_sync, which adds txs to
+// the pool without CheckTx. Call before Start.
+func (n *Node) DisableAPIBroadcast() {
+	n.apiServer.DisableBroadcast()
+}
+
 func (n *Node) IsRunning() bool {
 	// FIXME: set correct value
 	return true
