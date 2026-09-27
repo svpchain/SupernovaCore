@@ -54,4 +54,6 @@ const (
 	BlobSubnetTopicFormat = GossipProtocolAndDigest + GossipBlobSidecarMessage + "_%d"
 
 	ConsensusTopic = "/supernova/consensus"
+	// TxTopic carries batches of transactions between nodes' pools.
+	TxTopic = "/supernova/tx"
 )

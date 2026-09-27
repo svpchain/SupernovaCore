@@ -28,6 +28,7 @@ import (
 	"github.com/meterio/supernova/libs/rpc"
 
 	db "github.com/cometbft/cometbft-db"
+	abcitypes "github.com/cometbft/cometbft/v2/abci/types"
 	cmtnode "github.com/cometbft/cometbft/v2/node"
 	cmtproxy "github.com/cometbft/cometbft/v2/proxy"
 	"github.com/ethereum/go-ethereum/common/mclock"
@@ -111,6 +112,8 @@ type Node struct {
 	p2pSrv p2p.P2P
 
 	proxyApp cmtproxy.AppConns
+
+	txGossip *txGossip
 }
 
 func NewNode(
@@ -160,6 +163,8 @@ func NewNode(
 	}
 
 	txPool := txpool.New(chain, txpool.DefaultTxPoolOptions)
+	// txs from the API and from peers must pass the app's CheckTx
+	txPool.SetValidator(abciCheckTx(proxyApp.Mempool()))
 	defer func() { slog.Info("closing tx pool..."); txPool.Close() }()
 
 	var BootstrapNodes []string
@@ -183,6 +188,8 @@ func NewNode(
 	}
 
 	p2pSrv := newP2PService(ctx, config, BootstrapNodes, geneBlock)
+	txGossip := newTxGossip(p2pSrv, txPool)
+	txPool.SetOnLocalAdd(txGossip.enqueue)
 
 	rpcServer := rpc.NewRPCServer(p2pSrv, chain, txPool)
 	rpcServer.Start(ctx)
@@ -226,6 +233,7 @@ func NewNode(
 		apiServer:     apiServer,
 		chain:         chain,
 		txPool:        txPool,
+		txGossip:      txGossip,
 		p2pSrv:        p2pSrv,
 		logger:        slog.With("pkg", "node"),
 		proxyApp:      proxyApp,
@@ -326,6 +334,8 @@ func (n *Node) Start() error {
 	n.communicator.Sync(n.handleBlockStream)
 
 	n.goes.Go(func() { n.apiServer.Start(n.ctx) })
+	n.goes.Go(func() { n.txGossip.publishLoop(n.ctx) })
+	n.goes.Go(func() { n.txGossip.receiveLoop(n.ctx) })
 	n.goes.Go(func() { n.houseKeeping(n.ctx) })
 	// n.goes.Go(func() { n.txStashLoop(n.ctx) })
 	n.goes.Go(func() {
@@ -600,6 +610,33 @@ func checkClockOffset() {
 	}
 	if resp.ClockOffset > time.Duration(types.BlockIntervalNano)*time.Nanosecond/2 {
 		slog.Warn("clock offset detected", "offset", types.PrettyDuration(resp.ClockOffset))
+	}
+}
+
+// SubmitTx adds a tx the caller has already validated (e.g. with the app's
+// CheckTx) to the pool and gossips it to peers.
+func (n *Node) SubmitTx(tx []byte) error {
+	return n.txPool.AddChecked(tx)
+}
+
+// SetTxValidator replaces the check applied to txs from the API and from
+// peers (default: ABCI CheckTx on the mempool connection). Embedders can use
+// it to validate outside the ABCI client lock. Call before Start.
+func (n *Node) SetTxValidator(f func(tx []byte) error) {
+	n.txPool.SetValidator(func(tx cmttypes.Tx) error { return f(tx) })
+}
+
+// abciCheckTx validates txs with the app's CheckTx.
+func abciCheckTx(conn cmtproxy.AppConnMempool) func(cmttypes.Tx) error {
+	return func(tx cmttypes.Tx) error {
+		res, err := conn.CheckTx(context.TODO(), &abcitypes.CheckTxRequest{Tx: tx, Type: abcitypes.CHECK_TX_TYPE_CHECK})
+		if err != nil {
+			return err
+		}
+		if res.Code != abcitypes.CodeTypeOK {
+			return fmt.Errorf("CheckTx code %d (%s): %s", res.Code, res.Codespace, res.Log)
+		}
+		return nil
 	}
 }
 

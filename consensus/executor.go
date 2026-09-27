@@ -48,9 +48,23 @@ func (e *Executor) PrepareProposal(parent *block.DraftBlock, proposerIndex int, 
 	maxDataBytes := cmttypes.MaxDataBytes(maxBytes, evSize, vset.Size())
 	proposerAddr, validator := vset.GetByIndex(int32(proposerIndex))
 
+	// Validators reject proposals containing a tx that is already in an
+	// uncommitted ancestor (validateProposal), so leave those out. The pool only
+	// drops a tx once this node has processed the proposal that contains it,
+	// which can be after it gathers the QC for that proposal and proposes next.
+	inFlight := make(map[string]struct{})
+	for d := parent; d != nil && !d.Committed && d.ProposedBlock != nil; d = e.chain.GetDraft(d.ProposedBlock.ParentID()) {
+		for _, tx := range d.ProposedBlock.Transactions() {
+			inFlight[string(tx.Hash())] = struct{}{}
+		}
+	}
+
 	executables := e.txPool.Executables()
-	txs := make([][]byte, 0)
+	txs := make([][]byte, 0, len(executables))
 	for _, tx := range executables {
+		if _, ok := inFlight[string(tx.Hash())]; ok {
+			continue
+		}
 		txs = append(txs, tx)
 	}
 

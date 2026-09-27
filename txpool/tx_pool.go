@@ -10,11 +10,13 @@ import (
 	"errors"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cometbft/cometbft/v2/libs/bytes"
 	cmttypes "github.com/cometbft/cometbft/v2/types"
 	"github.com/ethereum/go-ethereum/event"
+	lru "github.com/hashicorp/golang-lru"
 	"github.com/meterio/supernova/chain"
 	"github.com/meterio/supernova/libs/co"
 	"github.com/meterio/supernova/types"
@@ -49,6 +51,14 @@ type TxPool struct {
 	chain   *chain.Chain
 
 	executables sync.Map // key: txId, value: txObject
+	// ids of txs recently removed (included in an accepted proposal), so a late
+	// copy from a peer or client is not re-added and proposed again
+	recent *lru.Cache
+
+	// validator checks txs from untrusted sources (Add, AddRemote); nil = none
+	validator atomic.Pointer[func(cmttypes.Tx) error]
+	// onLocalAdd is called for txs added via Add/AddChecked (e.g. to gossip them)
+	onLocalAdd atomic.Pointer[func(cmttypes.Tx)]
 
 	done   chan struct{}
 	txFeed event.Feed
@@ -60,8 +70,15 @@ type TxPool struct {
 
 // New create a new TxPool instance.
 // Shutdown is required to be called at end.
+const recentlyRemovedSize = 200_000
+
 func New(chain *chain.Chain, options Options) *TxPool {
+	recent, err := lru.New(recentlyRemovedSize)
+	if err != nil {
+		panic(err)
+	}
 	pool := &TxPool{
+		recent:      recent,
 		options:     options,
 		executables: sync.Map{},
 		chain:       chain,
@@ -85,22 +102,72 @@ func (p *TxPool) SubscribeTxEvent(ch chan *TxEvent) event.Subscription {
 	return p.scope.Track(p.txFeed.Subscribe(ch))
 }
 
+// SetValidator sets the check applied to txs from untrusted sources (Add and
+// AddRemote), e.g. ABCI CheckTx.
+func (p *TxPool) SetValidator(f func(cmttypes.Tx) error) {
+	p.validator.Store(&f)
+}
+
+// SetOnLocalAdd sets a callback for txs accepted via Add or AddChecked.
+func (p *TxPool) SetOnLocalAdd(f func(cmttypes.Tx)) {
+	p.onLocalAdd.Store(&f)
+}
+
+// Add adds a tx submitted to this node (e.g. via the API): validated, then
+// announced via the local-add callback.
 func (p *TxPool) Add(newTx cmttypes.Tx) error {
+	return p.add(newTx, true, true)
+}
+
+// AddChecked adds a tx the caller has already validated (e.g. with its own
+// CheckTx), then announces it via the local-add callback.
+func (p *TxPool) AddChecked(newTx cmttypes.Tx) error {
+	return p.add(newTx, false, true)
+}
+
+// AddRemote adds a tx received from a peer: validated, not re-announced.
+func (p *TxPool) AddRemote(newTx cmttypes.Tx) error {
+	return p.add(newTx, true, false)
+}
+
+func (p *TxPool) add(newTx cmttypes.Tx, validate, local bool) error {
 	txObj, err := resolveTx(newTx)
 	if err != nil {
 		return badTxError{err.Error()}
 	}
 
-	// Check if key exists
-	if _, ok := p.executables.Load(newTx.Hash().String()); ok {
-		// key exist
+	id := newTx.Hash().String()
+	if _, ok := p.executables.Load(id); ok {
 		return errTxExisted
-	} else {
-		// key doesn not exist
-		p.executables.Store(newTx.Hash().String(), txObj)
+	}
+	if p.recent.Contains(id) {
+		return errTxExisted
+	}
+	if validate {
+		if v := p.validator.Load(); v != nil {
+			if err := (*v)(newTx); err != nil {
+				return badTxError{err.Error()}
+			}
+		}
+	}
+	if _, loaded := p.executables.LoadOrStore(id, txObj); loaded {
+		return errTxExisted
+	}
+	// Validation can take a while; if the tx was included in a processed
+	// proposal meanwhile, Remove ran before our store and couldn't delete it.
+	// Remove records the id before deleting, so checking after storing closes
+	// the race.
+	if p.recent.Contains(id) {
+		p.executables.Delete(id)
+		return errTxExisted
 	}
 
-	p.logger.Info("tx added", "id", newTx.Hash())
+	p.logger.Debug("tx added", "id", newTx.Hash())
+	if local {
+		if f := p.onLocalAdd.Load(); f != nil {
+			(*f)(newTx)
+		}
+	}
 	p.goes.Go(func() {
 		v := true
 		p.txFeed.Send(&TxEvent{newTx, &v})
@@ -120,10 +187,11 @@ func (p *TxPool) Get(id []byte) cmttypes.Tx {
 // Remove removes tx from pool by its ID.
 func (p *TxPool) Remove(id []byte) bool {
 	strId := bytes.HexBytes(id).String()
+	p.recent.Add(strId, struct{}{})
 	if _, ok := p.executables.Load(strId); ok {
 		p.executables.Delete(strId)
 		hash := hex.EncodeToString(id)
-		p.logger.Info("tx removed", "id", hash)
+		p.logger.Debug("tx removed", "id", hash)
 		return true
 	}
 	return false
