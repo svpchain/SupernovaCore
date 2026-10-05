@@ -40,7 +40,7 @@ func TestVerifyVoteExtensionCallsApplicationWithSignedData(t *testing.T) {
 	nonRp := []byte("extra")
 	sig := master.SignMessage(types.GetMsgHashForVoteExtension(1, id[:], ext)).Marshal()
 	nonRpSig := master.SignMessage(nonRp).Marshal()
-	if !p.verifyApplicationVoteExtension(0, id, ext, sig, nonRp, nonRpSig) {
+	if !p.verifyApplicationVoteExtension(0, id, 0, ext, sig, nil, nonRp, nonRpSig) {
 		t.Fatal("valid extension rejected")
 	}
 	if conn.request == nil || conn.request.Height != 1 ||
@@ -49,11 +49,11 @@ func TestVerifyVoteExtensionCallsApplicationWithSignedData(t *testing.T) {
 		t.Fatalf("wrong application VerifyVoteExtension request: %+v", conn.request)
 	}
 	conn.status = v2.VERIFY_VOTE_EXTENSION_STATUS_REJECT
-	if p.verifyApplicationVoteExtension(0, id, ext, sig, nonRp, nonRpSig) {
+	if p.verifyApplicationVoteExtension(0, id, 0, ext, sig, nil, nonRp, nonRpSig) {
 		t.Fatal("application rejection ignored")
 	}
 	conn.request = nil
-	if p.verifyApplicationVoteExtension(0, id, ext, []byte("bad-signature"), nonRp, nonRpSig) || conn.request != nil {
+	if p.verifyApplicationVoteExtension(0, id, 0, ext, []byte("bad-signature"), nil, nonRp, nonRpSig) || conn.request != nil {
 		t.Fatal("invalid signature reached application")
 	}
 }

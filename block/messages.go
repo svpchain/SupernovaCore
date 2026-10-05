@@ -178,6 +178,7 @@ type PMVoteMessage struct {
 
 	VoteExtension           []byte // repeat-protected support for cometbft vote extension
 	ExtensionSignature      []byte
+	AppExtensionSignature   []byte // Ed25519 signature for SVP/Slinky
 	NonRpVoteExtension      []byte // non-repeat-protected
 	NonRpExtensionSignature []byte
 
@@ -212,6 +213,9 @@ func (m *PMVoteMessage) GetMsgHash() types.Bytes32 {
 		m.VoteExtension,
 		m.NonRpVoteExtension,
 	})
+	if len(m.AppExtensionSignature) != 0 {
+		bs, err = rlp.EncodeToBytes([]interface{}{bs, m.AppExtensionSignature})
+	}
 	if err != nil {
 		slog.Error("RLP Encode Error", "err", err)
 	}
@@ -253,6 +257,7 @@ type PMTimeoutMessage struct {
 
 	LastVoteExtension           []byte
 	LastExtensionSignature      []byte
+	LastAppExtensionSignature   []byte
 	LastNonRpVoteExtension      []byte
 	LastNonRpExtensionSignature []byte
 
@@ -294,6 +299,9 @@ func (m *PMTimeoutMessage) GetMsgHash() types.Bytes32 {
 		m.LastVoteExtension,
 		m.LastNonRpVoteExtension,
 	})
+	if len(m.LastAppExtensionSignature) != 0 {
+		bs, err = rlp.EncodeToBytes([]interface{}{bs, m.LastAppExtensionSignature})
+	}
 	if err != nil {
 		slog.Error("RLP Encode Error", "err", err)
 	}

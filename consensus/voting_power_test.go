@@ -45,7 +45,7 @@ func TestQCAndTCUseVotingPowerNotValidatorCount(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if qc, _ := qcMan.AddVerifiedVote(uint32(i), v, 1, 3, id, parsed, nil, nil, nil, nil); qc != nil {
+		if qc, _ := qcMan.AddVerifiedVote(uint32(i), v, 1, 3, id, parsed, nil, nil, nil, nil, nil); qc != nil {
 			t.Fatal("two 10-power validators formed a QC")
 		}
 		if tc := tcMan.AddVote(uint32(i), 1, 3, master.SignMessage(timeoutHash[:]).Marshal(), timeoutHash); tc != nil {
@@ -57,7 +57,7 @@ func TestQCAndTCUseVotingPowerNotValidatorCount(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	qc, _ := qcMan.AddVerifiedVote(highIndex, committee.Validators[highIndex], 1, 3, id, parsed, nil, nil, nil, nil)
+	qc, _ := qcMan.AddVerifiedVote(highIndex, committee.Validators[highIndex], 1, 3, id, parsed, nil, nil, nil, nil, nil)
 	if qc == nil {
 		t.Fatal("80-power validator did not complete a QC")
 	}

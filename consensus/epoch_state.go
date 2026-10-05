@@ -20,6 +20,7 @@ import (
 )
 
 type EpochState struct {
+	appIdentities *AppIdentities
 	logger        *slog.Logger
 	epoch         uint64
 	startKBlockID types.Bytes32
@@ -119,7 +120,7 @@ func NewPendingEpochState(vset *cmttypes.ValidatorSet, myPubKey bls.PublicKey, c
 	}, nil
 }
 
-func (es *EpochState) AddQCVote(signerIndex uint32, round uint32, blockID types.Bytes32, sig []byte, voteExtension []byte, voteExtensionSignature []byte, nonRpExtension []byte, nonRpExtensionSignature []byte) (*block.QuorumCert, *v2.ExtendedCommitInfo) {
+func (es *EpochState) AddQCVote(signerIndex uint32, round uint32, blockID types.Bytes32, sig []byte, voteExtension []byte, voteExtensionSignature []byte, appExtensionSignature []byte, nonRpExtension []byte, nonRpExtensionSignature []byte) (*block.QuorumCert, *v2.ExtendedCommitInfo) {
 	v := es.committee.Validators[signerIndex]
 	signature, err := bls.SignatureFromBytes(sig)
 	if err != nil {
@@ -152,7 +153,7 @@ func (es *EpochState) AddQCVote(signerIndex uint32, round uint32, blockID types.
 		return nil, nil
 	}
 
-	return es.qcVoteManager.AddVerifiedVote(signerIndex, v, es.epoch, round, blockID, signature, voteExtension, voteExtensionSignature, nonRpExtension, nonRpExtensionSignature)
+	return es.qcVoteManager.AddVerifiedVote(signerIndex, v, es.epoch, round, blockID, signature, voteExtension, voteExtensionSignature, appExtensionSignature, nonRpExtension, nonRpExtensionSignature)
 }
 
 func (es *EpochState) AddTCVote(signerIndex uint32, round uint32, sig []byte, hash [32]byte) *types.TimeoutCert {

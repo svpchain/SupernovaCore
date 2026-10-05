@@ -1,11 +1,13 @@
 package consensus
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"time"
 
 	v2 "github.com/cometbft/cometbft/api/cometbft/abci/v2"
@@ -25,11 +27,12 @@ var (
 )
 
 type Executor struct {
-	proxyApp cmtproxy.AppConnConsensus
-	chain    *chain.Chain
-	txPool   *txpool.TxPool
-	logger   *slog.Logger
-	eventBus cmttypes.BlockEventPublisher
+	appIdentities *AppIdentities
+	proxyApp      cmtproxy.AppConnConsensus
+	chain         *chain.Chain
+	txPool        *txpool.TxPool
+	logger        *slog.Logger
+	eventBus      cmttypes.BlockEventPublisher
 }
 
 func NewExecutor(proxyApp cmtproxy.AppConnConsensus, c *chain.Chain, txPool *txpool.TxPool) *Executor {
@@ -46,7 +49,14 @@ func (e *Executor) PrepareProposal(parent *block.DraftBlock, proposerIndex int, 
 	evSize := int64(0)
 	vset := e.chain.GetValidatorsByHash(parent.ProposedBlock.NextValidatorsHash())
 	maxDataBytes := cmttypes.MaxDataBytes(maxBytes, evSize, vset.Size())
-	proposerAddr, _ := vset.GetByIndex(int32(proposerIndex))
+	proposerAddr, proposer := vset.GetByIndex(int32(proposerIndex))
+	if e.appIdentities != nil {
+		var err error
+		proposerAddr, err = e.appIdentities.appAddressFor(proposer)
+		if err != nil {
+			return nil, err
+		}
+	}
 
 	executables := e.txPool.Executables()
 	txs := make([][]byte, 0)
@@ -101,13 +111,23 @@ func (e *Executor) ProcessProposal(blk *block.Block) (bool, error) {
 		parentDraft := e.chain.GetDraft(blk.ParentID())
 		parent = parentDraft.ProposedBlock
 	}
-	proposerAddr, _ := vset.GetByIndex(int32(blk.ProposerIndex()))
+	proposerAddr, proposer := vset.GetByIndex(int32(blk.ProposerIndex()))
+	if e.appIdentities != nil {
+		proposerAddr, err = e.appIdentities.appAddressFor(proposer)
+		if err != nil {
+			return false, err
+		}
+	}
+	lastCommit, err := e.lastCommitInfo(parent, blk)
+	if err != nil {
+		return false, err
+	}
 	resp, err := e.proxyApp.ProcessProposal(context.TODO(), &v2.ProcessProposalRequest{
 		Hash:               blk.ID().Bytes(),
 		Height:             int64(blk.Number()),
 		Time:               time.Unix(0, int64(blk.NanoTimestamp())),
 		Txs:                blk.Txs.Convert(),
-		ProposedLastCommit: e.chain.BuildLastCommitInfo(parent, blk),
+		ProposedLastCommit: lastCommit,
 		Misbehavior:        make([]v2.Misbehavior, 0), // FIXME: track the misbehavior and preppare the evidence
 		ProposerAddress:    proposerAddr,
 		NextValidatorsHash: blk.NextValidatorsHash(),
@@ -170,8 +190,17 @@ func (e *Executor) applyBlock(blk *block.Block, syncingToHeight int64) (appHash 
 		parentDraft := e.chain.GetDraft(blk.ParentID())
 		parent = parentDraft.ProposedBlock
 	}
-	proposerAddr, _ := vset.GetByIndex(int32(blk.ProposerIndex()))
-	decidedLastCommit := e.chain.BuildLastCommitInfo(parent, blk)
+	proposerAddr, proposer := vset.GetByIndex(int32(blk.ProposerIndex()))
+	if e.appIdentities != nil {
+		proposerAddr, err = e.appIdentities.appAddressFor(proposer)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	decidedLastCommit, err := e.lastCommitInfo(parent, blk)
+	if err != nil {
+		return nil, nil, err
+	}
 	// fmt.Println("Decided Last Commit")
 	// for _, v := range decidedLastCommit.Votes {
 	// 	fmt.Println("decided last commit: ", "address:", v.Validator.Address, "power:", v.Validator.Power)
@@ -192,6 +221,9 @@ func (e *Executor) applyBlock(blk *block.Block, syncingToHeight int64) (appHash 
 	if err != nil {
 		e.logger.Error("Finalize block failed", "err", err)
 		return
+	}
+	if e.appIdentities != nil && (len(abciResponse.ValidatorUpdates) != 0 || abciResponse.ConsensusParamUpdates != nil) {
+		return nil, nil, fmt.Errorf("SVP identity mode cannot apply validator or consensus parameter updates until dual-key updates are implemented")
 	}
 	appHash = abciResponse.AppHash
 	e.logger.Info(
@@ -318,4 +350,32 @@ func CalcAddedValidators(curVSet, nxtVSet *cmttypes.ValidatorSet) (added []*cmtt
 // If not called, it defaults to types.NopEventBus.
 func (e *Executor) SetEventBus(eventBus cmttypes.BlockEventPublisher) {
 	e.eventBus = eventBus
+}
+
+// lastCommitInfo converts the BLS QC's signer bitset to the SVP staking
+// validator view, retaining absent votes in power/address order.
+func (e *Executor) lastCommitInfo(parent, blk *block.Block) (abci.CommitInfo, error) {
+	info := e.chain.BuildLastCommitInfo(parent, blk)
+	if e.appIdentities == nil {
+		return info, nil
+	}
+	vset := e.chain.GetValidatorsByHash(parent.ValidatorsHash())
+	if vset == nil && len(info.Votes) != 0 {
+		return abci.CommitInfo{}, fmt.Errorf("missing parent validator set")
+	}
+	for i := range info.Votes {
+		_, validator := vset.GetByIndex(int32(i))
+		address, err := e.appIdentities.appAddressFor(validator)
+		if err != nil {
+			return abci.CommitInfo{}, err
+		}
+		info.Votes[i].Validator.Address = address
+	}
+	sort.Slice(info.Votes, func(i, j int) bool {
+		if info.Votes[i].Validator.Power != info.Votes[j].Validator.Power {
+			return info.Votes[i].Validator.Power > info.Votes[j].Validator.Power
+		}
+		return bytes.Compare(info.Votes[i].Validator.Address, info.Votes[j].Validator.Address) < 0
+	})
+	return info, nil
 }

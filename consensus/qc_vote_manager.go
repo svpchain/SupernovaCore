@@ -1,8 +1,10 @@
 package consensus
 
 import (
+	"bytes"
 	"fmt"
 	"log/slog"
+	"sort"
 
 	"github.com/OffchainLabs/prysm/v6/crypto/bls"
 	v2 "github.com/cometbft/cometbft/api/cometbft/abci/v2"
@@ -24,6 +26,7 @@ type voteKey struct {
 }
 
 type QCVoteManager struct {
+	appIdentities *AppIdentities
 	votes         map[voteKey]map[uint32]*voteValue
 	sealed        map[voteKey]bool
 	committeeSize uint32
@@ -47,7 +50,10 @@ func (m *QCVoteManager) Size() uint32 {
 	return m.committeeSize
 }
 
-func (m *QCVoteManager) AddVerifiedVote(index uint32, validator *cmttypes.Validator, epoch uint64, round uint32, blockID types.Bytes32, blsSig bls.Signature, voteExtension, extensionSignature, nonRpVoteExtension, nonRpExtensionSignature []byte) (*block.QuorumCert, *v2.ExtendedCommitInfo) {
+func (m *QCVoteManager) AddVerifiedVote(index uint32, validator *cmttypes.Validator, epoch uint64, round uint32, blockID types.Bytes32, blsSig bls.Signature, voteExtension, extensionSignature, appExtensionSignature, nonRpVoteExtension, nonRpExtensionSignature []byte) (*block.QuorumCert, *v2.ExtendedCommitInfo) {
+	if m.appIdentities != nil && !m.appIdentities.verifyExtension(validator, int64(block.Number(blockID)), int32(round), voteExtension, appExtensionSignature) {
+		return nil, nil
+	}
 	key := voteKey{Round: round, BlockID: blockID}
 	if _, existed := m.votes[key]; !existed {
 		m.votes[key] = make(map[uint32]*voteValue)
@@ -57,13 +63,20 @@ func (m *QCVoteManager) AddVerifiedVote(index uint32, validator *cmttypes.Valida
 		return nil, nil
 	}
 
+	appAddressBytes := cmttypes.TM2PB.Validator(validator).Address
+	appSignature := extensionSignature
+	if m.appIdentities != nil {
+		identity, _ := m.appIdentities.forValidator(validator)
+		appAddressBytes = appAddress(identity.AppPubKey)
+		appSignature = appExtensionSignature
+	}
 	m.votes[key][index] = &voteValue{
 		Signature: blsSig,
 		VoteInfo: v2.ExtendedVoteInfo{
-			Validator:               cmttypes.TM2PB.Validator(validator),
+			Validator:               v2.Validator{Address: appAddressBytes, Power: validator.VotingPower},
 			BlockIdFlag:             cmttypesv2.BlockIDFlagCommit,
 			VoteExtension:           voteExtension,
-			ExtensionSignature:      extensionSignature,
+			ExtensionSignature:      appSignature,
 			NonRpVoteExtension:      nonRpVoteExtension,
 			NonRpExtensionSignature: nonRpExtensionSignature,
 		},
@@ -100,6 +113,9 @@ func (m *QCVoteManager) seal(round uint32, blockID types.Bytes32) {
 }
 
 func (m *QCVoteManager) Aggregate(round uint32, blockID types.Bytes32, epoch uint64) (*block.QuorumCert, *v2.ExtendedCommitInfo) {
+	if m.appIdentities != nil && m.appIdentities.ValidateCommittee(m.committee) != nil {
+		return nil, nil
+	}
 	m.seal(round, blockID)
 	sigs := make([]bls.Signature, 0)
 	key := voteKey{Round: round, BlockID: blockID}
@@ -114,11 +130,24 @@ func (m *QCVoteManager) Aggregate(round uint32, blockID types.Bytes32, epoch uin
 			bitArray.SetIndex(index, true)
 			votes = append(votes, v.VoteInfo)
 		} else {
+			addr := cmttypes.TM2PB.Validator(validator).Address
+			if m.appIdentities != nil {
+				identity, _ := m.appIdentities.forValidator(validator)
+				addr = appAddress(identity.AppPubKey)
+			}
 			votes = append(votes, v2.ExtendedVoteInfo{
-				Validator:   cmttypes.TM2PB.Validator(validator),
+				Validator:   v2.Validator{Address: addr, Power: validator.VotingPower},
 				BlockIdFlag: cmttypesv2.BlockIDFlagAbsent,
 			})
 		}
+	}
+	if m.appIdentities != nil {
+		sort.Slice(votes, func(i, j int) bool {
+			if votes[i].Validator.Power != votes[j].Validator.Power {
+				return votes[i].Validator.Power > votes[j].Validator.Power
+			}
+			return bytes.Compare(votes[i].Validator.Address, votes[j].Validator.Address) < 0
+		})
 	}
 	aggrSig := bls.AggregateSignatures(sigs)
 

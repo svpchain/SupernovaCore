@@ -39,6 +39,12 @@ func (p *Pacemaker) CommitBlock(blk *block.Block, escortQC *block.QuorumCert) er
 		p.logger.Info("next validator set is not empty", "len", len(nxtVSet.Validators))
 		p.addedValidators = CalcAddedValidators(p.epochState.committee, nxtVSet)
 		p.nextEpochState, err = NewPendingEpochState(nxtVSet, p.blsMaster.PubKey, p.epochState.epoch)
+		if err == nil && p.appIdentities != nil {
+			err = p.appIdentities.ValidateCommittee(p.nextEpochState.committee)
+			if err == nil {
+				p.nextEpochState.appIdentities = p.appIdentities
+			}
+		}
 		if err != nil {
 			p.logger.Error("could not calc pending epoch state", "err", err)
 			return err

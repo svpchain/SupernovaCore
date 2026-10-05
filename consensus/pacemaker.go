@@ -7,6 +7,7 @@ package consensus
 
 import (
 	"context"
+	"crypto/ed25519"
 	"encoding/hex"
 	"fmt"
 	"log/slog"
@@ -45,14 +46,16 @@ func init() {
 }
 
 type Pacemaker struct {
-	ctx          context.Context
-	version      string
-	chain        *chain.Chain
-	blsMaster    *types.BlsMaster
-	logger       *slog.Logger
-	executor     *Executor
-	txpool       *txpool.TxPool
-	communicator *rpc.Communicator
+	ctx           context.Context
+	version       string
+	chain         *chain.Chain
+	blsMaster     *types.BlsMaster
+	appIdentities *AppIdentities
+	appPrivateKey ed25519.PrivateKey
+	logger        *slog.Logger
+	executor      *Executor
+	txpool        *txpool.TxPool
+	communicator  *rpc.Communicator
 
 	// Current round (current_round - highest_qc_round determines the timeout).
 	// Current round is basically max(highest_qc_round, highest_received_tc, highest_local_tc) + 1
@@ -446,10 +449,10 @@ func (p *Pacemaker) OnReceiveVote(mi IncomingMsg) {
 		return
 	}
 
-	if !p.verifyApplicationVoteExtension(msg.GetSignerIndex(), msg.VoteBlockID, msg.VoteExtension, msg.ExtensionSignature, msg.NonRpVoteExtension, msg.NonRpExtensionSignature) {
+	if !p.verifyApplicationVoteExtension(msg.GetSignerIndex(), msg.VoteBlockID, msg.VoteRound, msg.VoteExtension, msg.ExtensionSignature, msg.AppExtensionSignature, msg.NonRpVoteExtension, msg.NonRpExtensionSignature) {
 		return
 	}
-	qc, commitInfo := p.epochState.AddQCVote(msg.GetSignerIndex(), round, msg.VoteBlockID, msg.VoteSignature, msg.VoteExtension, msg.ExtensionSignature, msg.NonRpVoteExtension, msg.NonRpExtensionSignature)
+	qc, commitInfo := p.epochState.AddQCVote(msg.GetSignerIndex(), round, msg.VoteBlockID, msg.VoteSignature, msg.VoteExtension, msg.ExtensionSignature, msg.AppExtensionSignature, msg.NonRpVoteExtension, msg.NonRpExtensionSignature)
 	if qc == nil {
 		p.logger.Debug("no qc formed")
 		return
@@ -564,10 +567,10 @@ func (p *Pacemaker) OnReceiveTimeout(mi IncomingMsg) {
 	}
 
 	// collect vote and see if QC is formed
-	if msg.LastVoteBlockID != (types.Bytes32{}) && !p.verifyApplicationVoteExtension(msg.SignerIndex, msg.LastVoteBlockID, msg.LastVoteExtension, msg.LastExtensionSignature, msg.LastNonRpVoteExtension, msg.LastNonRpExtensionSignature) {
+	if msg.LastVoteBlockID != (types.Bytes32{}) && !p.verifyApplicationVoteExtension(msg.SignerIndex, msg.LastVoteBlockID, msg.LastVoteRound, msg.LastVoteExtension, msg.LastExtensionSignature, msg.LastAppExtensionSignature, msg.LastNonRpVoteExtension, msg.LastNonRpExtensionSignature) {
 		return
 	}
-	newQC, commitInfo := p.epochState.AddQCVote(msg.SignerIndex, msg.LastVoteRound, msg.LastVoteBlockID, msg.LastVoteSignature, msg.LastVoteExtension, msg.LastExtensionSignature, msg.LastNonRpVoteExtension, msg.LastNonRpExtensionSignature)
+	newQC, commitInfo := p.epochState.AddQCVote(msg.SignerIndex, msg.LastVoteRound, msg.LastVoteBlockID, msg.LastVoteSignature, msg.LastVoteExtension, msg.LastExtensionSignature, msg.LastAppExtensionSignature, msg.LastNonRpVoteExtension, msg.LastNonRpExtensionSignature)
 	if newQC != nil {
 		escortQCNode := p.chain.GetDraftByEscortQC(newQC)
 		p.UpdateQCHigh(&block.DraftQC{QCNode: escortQCNode, QC: newQC})
@@ -611,7 +614,16 @@ func (p *Pacemaker) updateEpochState(leaf *block.Block) bool {
 	}
 
 	if epochState == nil {
-		p.logger.Warn("EPOCH STATE IS EMPTY")
+		p.logger.Error("epoch state is empty")
+		return false
+	}
+	if p.appIdentities != nil {
+		if err := p.appIdentities.ValidateCommittee(epochState.committee); err != nil {
+			p.logger.Error("app identity mapping invalid", "err", err)
+			return false
+		}
+		epochState.appIdentities = p.appIdentities
+		epochState.qcVoteManager.appIdentities = p.appIdentities
 	}
 
 	p.logger.Info("---------------------------------------------------------")

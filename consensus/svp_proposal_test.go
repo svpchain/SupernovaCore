@@ -65,7 +65,7 @@ func TestExtendedCommitInfoIncludesAbsentValidatorsInOrder(t *testing.T) {
 			t.Fatal(err)
 		}
 		qc, info = manager.AddVerifiedVote(index, committee.Validators[index], 1, 3, blockID, signature,
-			[]byte{byte(index)}, []byte("signature"), nil, nil)
+			[]byte{byte(index)}, []byte("signature"), nil, nil, nil)
 	}
 	if qc == nil || info == nil || len(info.Votes) != 4 {
 		t.Fatalf("expected 4 ordered vote slots and QC, got QC=%v info=%v", qc, info)

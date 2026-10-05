@@ -11,10 +11,12 @@ package consensus
 
 import (
 	"context"
+	"crypto/ed25519"
 	sha256 "crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -74,6 +76,15 @@ func (p *Pacemaker) BuildVoteMessage(proposalMsg *block.PMProposalMessage, voteE
 		NonRpExtensionSignature: nonRpExtensionSignature.Marshal(),
 	}
 
+	if p.appIdentities != nil {
+		if proposalMsg.Round > math.MaxInt32 {
+			return nil, fmt.Errorf("SVP application vote round overflows int32")
+		}
+		if p.epochState == nil || !p.epochState.InCommittee() || len(p.appPrivateKey) != ed25519.PrivateKeySize {
+			return nil, fmt.Errorf("missing local SVP application signer")
+		}
+		msg.AppExtensionSignature = ed25519.Sign(p.appPrivateKey, canonicalExtensionSignBytes(p.appIdentities.chainID, int64(proposedBlock.Number()), int32(proposalMsg.Round), voteExtension))
+	}
 	// sign message
 	p.SignMessage(msg)
 	p.logger.Debug("Built Vote Message", "msg", msg.String())
@@ -119,6 +130,7 @@ func (p *Pacemaker) BuildTimeoutMessage(qcHigh *block.DraftQC, ti *PMRoundTimeou
 		msg.LastVoteSignature = lastVoteMsg.VoteSignature
 		msg.LastVoteExtension = lastVoteMsg.VoteExtension
 		msg.LastExtensionSignature = lastVoteMsg.ExtensionSignature
+		msg.LastAppExtensionSignature = lastVoteMsg.AppExtensionSignature
 		msg.LastNonRpVoteExtension = lastVoteMsg.NonRpVoteExtension
 		msg.LastNonRpExtensionSignature = lastVoteMsg.NonRpExtensionSignature
 	}
